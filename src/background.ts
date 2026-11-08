@@ -6,106 +6,178 @@
  *
  * Responsibilities (added in later phases):
  *   - Message routing from popup
- *   - API client calls (fetch series metadata)
+ *   - API client calls (series metadata + chapter image URLs)
  *   - Download queue management
- *   - Image URL extraction via content script
  *   - CBZ assembly via JSZip
  */
 
-import { KaganeApiClient } from './api/client';
+import { KaganeApiClient, extractSeriesId } from './api/client';
 import { getSettings, updateSettings } from './background/settings';
 import { DownloadQueue, type ChapterJob } from './background/download-queue';
-
-const apiClient = new KaganeApiClient();
 
 /** Active download queue instance (null when idle). */
 let activeQueue: DownloadQueue | null = null;
 
-/**
- * Stored image URLs extracted by content scripts from reader pages.
- * Keyed by bookId. Populated by 'reader:image-urls' messages.
- */
-const extractedImageUrls = new Map<string, { imageUrls: string[]; totalPages: number; seriesId?: string }>();
+// ── API tab proxy (Cloudflare clearance cookies only exist in a tab) ──
+let apiTabId: number | null = null;
+let temporaryApiTab = false;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Pending URL extraction promise resolvers, keyed by bookId. */
-const pendingResolvers = new Map<string, (urls: string[]) => void>();
+async function pingApiTab(tabId: number): Promise<boolean> {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: 'kagane:api-ping' });
+    return Boolean(response?.ok);
+  } catch {
+    return false;
+  }
+}
+
+async function findApiTab(): Promise<number | null> {
+  if (apiTabId != null && (await pingApiTab(apiTabId))) return apiTabId;
+  apiTabId = null;
+
+  const tabs = await chrome.tabs.query({ url: ['https://kagane.moe/*'] });
+  for (const tab of tabs) {
+    if (tab.id != null && (await pingApiTab(tab.id))) {
+      apiTabId = tab.id;
+      temporaryApiTab = false;
+      return apiTabId;
+    }
+  }
+  return null;
+}
+
+async function createApiTab(): Promise<number | null> {
+  try {
+    const tab = await chrome.tabs.create({ url: 'https://kagane.moe/', active: false });
+    if (tab.id == null) return null;
+
+    for (let attempt = 0; attempt < 60; attempt++) {
+      if (await pingApiTab(tab.id)) {
+        apiTabId = tab.id;
+        temporaryApiTab = true;
+        return tab.id;
+      }
+      await sleep(250);
+    }
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  } catch (err) {
+    console.warn('[Kagane] Could not open API tab:', err);
+  }
+  return null;
+}
+
+async function closeTemporaryApiTab(): Promise<void> {
+  if (apiTabId != null && temporaryApiTab) {
+    await chrome.tabs.remove(apiTabId).catch(() => {});
+  }
+  apiTabId = null;
+  temporaryApiTab = false;
+}
+
+async function requestViaTab(
+  tabId: number,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  const result = await chrome.tabs.sendMessage(tabId, {
+    type: 'kagane:api',
+    payload: {
+      url,
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+    },
+  });
+
+  if (!result?.ok) {
+    throw new Error(result?.error || 'API tab request failed');
+  }
+
+  return new Response(result.body || '', {
+    status: result.status || 200,
+    statusText: result.statusText || '',
+    headers: { 'Content-Type': result.contentType || 'application/json' },
+  });
+}
 
 /**
- * Map of tabs that currently have a kagane.to reader/series page loaded.
- * tabId -> { seriesId, bookId, url }
+ * Use the open kagane.moe tab when possible: its requests are same-origin and
+ * carry Cloudflare's partitioned clearance cookie. Fall back to direct fetch
+ * when no tab exists, and only open a temporary tab if that is also blocked.
  */
-const knownTabs = new Map<number, { seriesId: string; bookId: string; url: string }>();
+async function fetchViaTab(url: string, init: RequestInit): Promise<Response> {
+  const existingTab = await findApiTab();
+  if (existingTab != null) {
+    return requestViaTab(existingTab, url, init);
+  }
+
+  let direct: Response | null = null;
+  let directError: unknown;
+
+  try {
+    direct = await fetch(url, init);
+    if (direct.status !== 403) return direct;
+  } catch (err) {
+    directError = err;
+  }
+
+  const tabId = await createApiTab();
+  if (tabId != null) {
+    try {
+      return await requestViaTab(tabId, url, init);
+    } catch (err) {
+      directError = err;
+    }
+  }
+
+  if (direct) return direct;
+  throw directError instanceof Error ? directError : new Error(String(directError ?? 'API request failed'));
+}
+
+const apiClient = new KaganeApiClient({ fetchImpl: fetchViaTab });
 
 // ──────────────────────────────────────────
 // Install / Initialize
 // ──────────────────────────────────────────
 function registerDNRRules() {
+  const headers = [
+    { header: 'Referer', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.moe/' },
+    { header: 'Origin', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.moe' },
+  ];
+  const allTypes = [
+    chrome.declarativeNetRequest.ResourceType.MAIN_FRAME,
+    chrome.declarativeNetRequest.ResourceType.SUB_FRAME,
+    chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
+    chrome.declarativeNetRequest.ResourceType.IMAGE,
+    chrome.declarativeNetRequest.ResourceType.SCRIPT,
+    chrome.declarativeNetRequest.ResourceType.OTHER,
+  ];
+  // Downloads/images only — don't touch API fetches or page navigations.
+  const imageTypes = [
+    chrome.declarativeNetRequest.ResourceType.IMAGE,
+    chrome.declarativeNetRequest.ResourceType.OTHER,
+  ];
+
   const rules = [
     {
       id: 1,
       priority: 1,
       action: {
         type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
-        requestHeaders: [
-          { header: 'Referer', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to/' },
-          { header: 'Origin', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to' },
-        ],
+        requestHeaders: headers,
       },
-      condition: {
-        urlFilter: '||kstatic.to/',
-        resourceTypes: [
-          chrome.declarativeNetRequest.ResourceType.MAIN_FRAME,
-          chrome.declarativeNetRequest.ResourceType.SUB_FRAME,
-          chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
-          chrome.declarativeNetRequest.ResourceType.IMAGE,
-          chrome.declarativeNetRequest.ResourceType.SCRIPT,
-          chrome.declarativeNetRequest.ResourceType.OTHER,
-        ],
-      },
+      condition: { urlFilter: '||kstatic.to/', resourceTypes: allTypes },
     },
+    // Images served from kagane.moe itself still need a site referer.
     {
       id: 2,
       priority: 1,
       action: {
         type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
-        requestHeaders: [
-          { header: 'Referer', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to/' },
-          { header: 'Origin', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to' },
-        ],
+        requestHeaders: headers,
       },
-      condition: {
-        urlFilter: '||yuzuki.kagane.to/',
-        resourceTypes: [
-          chrome.declarativeNetRequest.ResourceType.MAIN_FRAME,
-          chrome.declarativeNetRequest.ResourceType.SUB_FRAME,
-          chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
-          chrome.declarativeNetRequest.ResourceType.IMAGE,
-          chrome.declarativeNetRequest.ResourceType.SCRIPT,
-          chrome.declarativeNetRequest.ResourceType.OTHER,
-        ],
-      },
-    },
-    {
-      id: 3,
-      priority: 1,
-      action: {
-        type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
-        requestHeaders: [
-          { header: 'Referer', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to/' },
-          { header: 'Origin', operation: chrome.declarativeNetRequest.HeaderOperation.SET, value: 'https://kagane.to' },
-        ],
-      },
-      condition: {
-        urlFilter: '||akari.kagane.to/',
-        resourceTypes: [
-          chrome.declarativeNetRequest.ResourceType.MAIN_FRAME,
-          chrome.declarativeNetRequest.ResourceType.SUB_FRAME,
-          chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST,
-          chrome.declarativeNetRequest.ResourceType.IMAGE,
-          chrome.declarativeNetRequest.ResourceType.SCRIPT,
-          chrome.declarativeNetRequest.ResourceType.OTHER,
-        ],
-      },
+      condition: { urlFilter: '||kagane.moe/', resourceTypes: imageTypes },
     },
   ];
 
@@ -132,7 +204,7 @@ chrome.runtime.onInstalled.addListener((details) => {
     });
   }
 
-  // ─── DNR: Set Referer header for kagane.to CDN domains ───
+  // ─── DNR: Set Referer header for kagane.moe CDN domains ───
   registerDNRRules();
 });
 
@@ -159,181 +231,6 @@ chrome.runtime.onStartup.addListener(() => {
   registerDNRRules();
 });
 
-// Track kagane.to tab lifetime so we know which tab to query.
-chrome.tabs.onRemoved.addListener((tabId) => {
-  knownTabs.delete(tabId);
-});
-chrome.tabs.onUpdated.addListener((tabId, _info, tab) => {
-  if (!tab.url || !/kagane\.to/.test(tab.url)) {
-    knownTabs.delete(tabId);
-  }
-});
-
-// ──────────────────────────────────────────
-// Extract series ID from URL
-// ──────────────────────────────────────────
-
-/**
- * Extract a series ID from a kagane.to URL.
- * Supports formats:
- *   https://kagane.to/series/{uuid}/...
- *   https://kagane.to/reader/{uuid}/{bookId}
- *   {id} (bare numeric or UUID string)
- */
-function extractSeriesId(url: string): string | null {
-  if (!url) return null;
-
-  // Bare ID (numeric or UUID)
-  if (/^[\w-]+$/.test(url)) return url;
-
-  try {
-    const u = new URL(url);
-    // /series/{id}... or /reader/{id}/...
-    const match = u.pathname.match(/\/(series|reader)\/([^/]+)/);
-    if (match) return match[2];
-  } catch {
-    // Not a valid URL, try raw path
-    const match = url.match(/\/(series|reader)\/([^/]+)/);
-    if (match) return match[2];
-  }
-
-  return null;
-}
-
-// ──────────────────────────────────────────
-// Image URL Extraction: open reader tabs to get DRM tokens
-// ──────────────────────────────────────────
-
-/** Small sleep helper for polling. */
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * For each book, locate an active kagane.to tab and ask its content script
- * (via the new iframe mechanism) to fetch image URLs for that chapter.
- * If no tab exists, open one in the foreground.
- *
- * Returns a map of bookId → imageUrls.
- */
-async function extractImageUrlsForChapters(
-  seriesId: string,
-  books: { bookId: string; chapterNo: string }[],
-): Promise<Map<string, string[]>> {
-  const result = new Map<string, string[]>();
-
-  const needExtraction = books.filter((b) => {
-    const stored = extractedImageUrls.get(b.bookId);
-    return !(stored && stored.imageUrls.length > 0);
-  });
-
-  // Reuse cached values for the others.
-  for (const book of books) {
-    const stored = extractedImageUrls.get(book.bookId);
-    if (stored && stored.imageUrls.length > 0) {
-      result.set(book.bookId, stored.imageUrls);
-    }
-  }
-
-  if (needExtraction.length === 0) return result;
-
-  // Extract one by one to avoid overloading the browser
-  for (const book of needExtraction) {
-    let tabId: number | undefined;
-    try {
-      const url = `https://kagane.to/series/${seriesId}/reader/${book.bookId}`;
-      console.log(`[Kagane] Opening background tab for extraction: ${url}`);
-      
-      // Open inactive tab
-      const tab = await chrome.tabs.create({
-        url,
-        active: false,
-      });
-      tabId = tab.id;
-
-      if (tabId != null) {
-        // Wait for content script to send URLs
-        const urls = await new Promise<string[]>((resolve) => {
-          const timeout = setTimeout(() => {
-            console.warn(`[Kagane] Timeout extracting URLs for book ${book.bookId}`);
-            pendingResolvers.delete(book.bookId);
-            resolve([]);
-          }, 25000); // 25s timeout per tab
-
-          pendingResolvers.set(book.bookId, (extractedUrls) => {
-            clearTimeout(timeout);
-            pendingResolvers.delete(book.bookId);
-            resolve(extractedUrls);
-          });
-        });
-
-        if (urls.length > 0) {
-          result.set(book.bookId, urls);
-        }
-      }
-    } catch (err) {
-      console.warn(`[Kagane] Failed to extract from tab for book ${book.bookId}:`, err);
-    } finally {
-      if (tabId != null) {
-        try {
-          await chrome.tabs.remove(tabId);
-          console.log(`[Kagane] Closed extraction tab ${tabId}`);
-        } catch (err) {
-          console.warn(`[Kagane] Failed to close tab ${tabId}:`, err);
-        }
-      }
-    }
-  }
-
-  return result;
-}
-
-async function findKaganeTab(): Promise<chrome.tabs.Tab | null> {
-  const tabs = await chrome.tabs.query({ url: ['https://kagane.to/*', 'https://www.kagane.to/*'] });
-  // Prefer an already-known reader/series tab, otherwise any kagane.to tab.
-  if (tabs.length === 0) return null;
-  for (const t of tabs) {
-    if (t.id != null && knownTabs.has(t.id)) return t;
-  }
-  return tabs[0];
-}
-
-async function openKaganeTab(seriesId: string): Promise<chrome.tabs.Tab | null> {
-  try {
-    const tab = await chrome.tabs.create({
-      url: `https://kagane.to/series/${seriesId}`,
-      active: false,
-    });
-    if (tab.id != null) {
-      // Give it a moment to load so the content script is injected.
-      await waitForContentScript(tab.id, 8000);
-    }
-    return tab;
-  } catch (err) {
-    console.warn('[Kagane] Failed to open tab:', err);
-    return null;
-  }
-}
-
-/**
- * Probe a tab until the content script responds (proves it's loaded &
- * listening). The script injects at document_idle so we give it up to
- * `timeoutMs` to settle.
- */
-async function waitForContentScript(tabId: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const probe = await chrome.tabs.sendMessage(tabId, { type: 'content-reader:ping' });
-      // Some listeners may respond, some may not — we just need the
-      // channel open with no error, so any reply (or absence of error)
-      // confirms the receiver exists.
-      if (probe !== undefined) return;
-    } catch (_) {
-      // No listener yet — wait and retry.
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-}
-
 // ──────────────────────────────────────────
 // Message Router
 // ──────────────────────────────────────────
@@ -345,11 +242,7 @@ export type BgMessage =
   | { type: 'get-settings' }
   | { type: 'update-settings'; settings: Partial<Record<string, unknown>> }
   | { type: 'cancel-download' }
-  | { type: 'get-progress' }
-  | { type: 'reader:image-urls'; payload: { bookId: string; imageUrls: string[]; totalPages: number; seriesId: string } }
-  | { type: 'reader:context'; payload: { seriesId: string; bookId: string; url: string } }
-  | { type: 'chapter:fetch-urls'; payload: { seriesId: string; bookId: string } }
-  | { type: 'content-reader:ping' };
+  | { type: 'get-progress' };
 
 export type BgResponse =
   | { ok: true; data?: unknown }
@@ -361,7 +254,7 @@ chrome.runtime.onMessage.addListener(
 
     switch (message.type) {
       case 'ping':
-        sendResponse({ ok: true, data: { version: '1.0.0' } });
+        sendResponse({ ok: true, data: { version: '2.0.0' } });
         break;
 
       case 'fetch-series': {
@@ -377,6 +270,12 @@ chrome.runtime.onMessage.addListener(
           })
           .catch((err) => {
             sendResponse({ ok: false, error: String(err) });
+          })
+          .finally(() => {
+            // Give the popup's follow-up cover request a moment to reuse the tab.
+            setTimeout(() => {
+              if (!activeQueue) void closeTemporaryApiTab();
+            }, 3000);
           });
         return true; // Keep channel open for async
       }
@@ -405,23 +304,6 @@ chrome.runtime.onMessage.addListener(
             // Sort by sortNo to maintain chapter order
             books.sort((a, b) => a.sortNo - b.sortNo);
 
-            // Extract image URLs by opening reader tabs for each chapter
-            const imageUrlsMap = await extractImageUrlsForChapters(
-              seriesId,
-              books.map((b) => ({ bookId: b.bookId, chapterNo: b.chapterNo })),
-            );
-
-            // Report which chapters failed extraction
-            const missingChapters: string[] = [];
-            for (const book of books) {
-              if (!imageUrlsMap.has(book.bookId)) {
-                missingChapters.push(`${book.chapterNo}`);
-              }
-            }
-            if (missingChapters.length > 0) {
-              console.warn(`[Kagane] No image URLs for chapters: ${missingChapters.join(', ')}`);
-            }
-
             const jobs: ChapterJob[] = books.map((book) => ({
               bookId: book.bookId,
               seriesId: series.seriesId,
@@ -432,7 +314,9 @@ chrome.runtime.onMessage.addListener(
               format: format || settings.format,
               status: 'queued' as const,
               progress: 0,
-              imageUrls: imageUrlsMap.get(book.bookId) || [],
+              imageUrls: [],
+              // Resolved inside the queue so chapter concurrency applies.
+              loadImageUrls: () => apiClient.getPageUrls(book.bookId),
               downloadedImages: [],
             }));
 
@@ -441,6 +325,9 @@ chrome.runtime.onMessage.addListener(
               settings.maxConcurrentChapters,
               settings.maxConcurrentImages,
             );
+            queue.onComplete = () => {
+              void closeTemporaryApiTab();
+            };
 
             // Cancel any previous download first
             if (activeQueue) {
@@ -478,6 +365,7 @@ chrome.runtime.onMessage.addListener(
         if (activeQueue) {
           activeQueue.cancel();
           activeQueue = null;
+          void closeTemporaryApiTab();
           sendResponse({ ok: true });
         } else {
           sendResponse({ ok: false, error: 'No active download to cancel' });
@@ -494,88 +382,32 @@ chrome.runtime.onMessage.addListener(
         break;
       }
 
-      case 'reader:image-urls': {
-        const payload = (message as {
-          type: 'reader:image-urls';
-          payload: { bookId: string; imageUrls: string[]; totalPages: number; seriesId: string };
-        }).payload;
-
-        if (payload && payload.bookId && Array.isArray(payload.imageUrls)) {
-          extractedImageUrls.set(payload.bookId, {
-            imageUrls: payload.imageUrls,
-            totalPages: payload.totalPages,
-            seriesId: payload.seriesId,
-          });
-          console.log(`[Kagane] Stored ${payload.imageUrls.length} image URLs for book ${payload.bookId}. First URL: ${payload.imageUrls[0]}`);
-          
-          const resolver = pendingResolvers.get(payload.bookId);
-          if (resolver) {
-            resolver(payload.imageUrls);
-          }
-          
-          sendResponse({ ok: true });
-        } else {
-          sendResponse({ ok: false, error: 'Invalid reader:image-urls payload' });
-        }
-        break;
-      }
-
-      case 'reader:context': {
-        const payload = (message as {
-          type: 'reader:context';
-          payload: { seriesId: string; bookId: string; url: string };
-        }).payload;
-        const tabId = _sender?.tab?.id;
-        if (tabId != null && payload) {
-          knownTabs.set(tabId, {
-            seriesId: payload.seriesId,
-            bookId: payload.bookId,
-            url: payload.url,
-          });
-        }
-        sendResponse({ ok: true });
-        break;
-      }
-
-      case 'content-reader:ping': {
-        sendResponse({ ok: true, data: { pong: Date.now() } });
-        break;
-      }
-
-      case 'chapter:fetch-urls': {
-        // Forward to the existing receiver on whichever tab the popup's
-        // open kagane.to tab is on. The message handler stays here so
-        // external callers (other content scripts / popups) can use it.
-        const payload = (message as {
-          type: 'chapter:fetch-urls';
-          payload: { seriesId: string; bookId: string };
-        }).payload;
-        (async () => {
-          const tab = await findKaganeTab();
-          if (!tab || tab.id == null) {
-            sendResponse({ ok: false, error: 'No kagane.to tab available' });
-            return;
-          }
-          try {
-            const resp = await chrome.tabs.sendMessage(tab.id, {
-              type: 'chapter:fetch-urls',
-              payload,
-            });
-            sendResponse(resp ?? { ok: false, error: 'No response from content script' });
-          } catch (err) {
-            sendResponse({ ok: false, error: String(err) });
-          }
-        })();
-        return true;
-      }
-
       case 'fetch-cover': {
         (async () => {
           try {
             const url = (message as { type: 'fetch-cover'; url: string }).url;
+
+            // Prefer the same-origin tab (Cloudflare cookies).
+            const tabId = await findApiTab();
+            if (tabId != null) {
+              try {
+                const result = await chrome.tabs.sendMessage(tabId, {
+                  type: 'kagane:api',
+                  payload: { url, binary: true },
+                });
+                if (result?.ok && result.body) {
+                  const mime = result.contentType || 'image/jpeg';
+                  sendResponse({ ok: true, data: { dataUrl: `data:${mime};base64,${result.body}` } });
+                  return;
+                }
+              } catch {
+                // Fall through to direct fetch.
+              }
+            }
+
             const response = await fetch(url, {
+              credentials: 'include',
               headers: {
-                Referer: 'https://kagane.to/',
                 Accept: 'image/avif,image/webp,image/*,*/*;q=0.8',
               },
             });

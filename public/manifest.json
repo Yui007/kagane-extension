@@ -1,22 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Kagane Downloader",
-  "version": "1.0.0",
-  "description": "Download manga chapters from kagane.to with multi-format export",
+  "version": "2.0.0",
+  "description": "Download manga chapters from kagane.moe with multi-format export",
   "permissions": [
     "storage",
     "downloads",
     "declarativeNetRequest",
     "alarms",
-    "scripting",
     "offscreen"
   ],
   "host_permissions": [
-    "https://yuzuki.kagane.to/*",
-    "https://kagane.to/*",
-    "https://*.kagane.to/*",
-    "https://kstatic.to/*",
-    "https://akari.kagane.to/*"
+    "https://kagane.moe/*",
+    "https://*.kagane.moe/*",
+    "https://kstatic.to/*"
   ],
   "background": {
     "service_worker": "assets/background.js",
@@ -38,11 +35,8 @@
   },
   "content_scripts": [
     {
-      "matches": [
-        "https://kagane.to/*",
-        "https://www.kagane.to/*"
-      ],
-      "js": ["content-reader.js"],
+      "matches": ["https://kagane.moe/*"],
+      "js": ["api-bridge.js"],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

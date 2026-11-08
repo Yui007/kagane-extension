@@ -297,6 +297,24 @@ describe('DownloadQueue', () => {
       queue['notifyProgress']();
       expect(listener).not.toHaveBeenCalled();
     });
+
+    it('calls onComplete once when every chapter has finished', async () => {
+      const mockFetch = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        () => Promise.resolve(new Response(new ArrayBuffer(100), {
+          status: 200,
+          headers: { 'Content-Type': 'image/jpeg' },
+        })),
+      );
+      const onComplete = vi.fn();
+      queue.onComplete = onComplete;
+
+      queue.addChapters([makeJob({ imageUrls: ['https://example.com/img.jpg'] })]);
+      await new Promise((r) => setTimeout(r, 150));
+      queue['notifyProgress']();
+
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      mockFetch.mockRestore();
+    });
   });
 
   describe('state machine transitions', () => {
@@ -308,6 +326,40 @@ describe('DownloadQueue', () => {
 
       expect(job.status).toBe('failed');
       expect(job.error).toBe('No image URLs provided');
+    });
+
+    it('resolves image URLs with loadImageUrls before downloading', async () => {
+      const mockFetch = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        () => Promise.resolve(new Response(new ArrayBuffer(100), {
+          status: 200,
+          headers: { 'Content-Type': 'image/jpeg' },
+        })),
+      );
+      const loadImageUrls = vi.fn().mockResolvedValue(['https://example.com/page1.jpg']);
+
+      const job = makeJob({ imageUrls: [], loadImageUrls });
+      queue.addChapters([job]);
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(loadImageUrls).toHaveBeenCalledTimes(1);
+      expect(job.imageUrls).toEqual(['https://example.com/page1.jpg']);
+      expect(job.status).toBe('done');
+
+      mockFetch.mockRestore();
+    });
+
+    it('fails the chapter when loadImageUrls throws', async () => {
+      const job = makeJob({
+        imageUrls: [],
+        loadImageUrls: vi.fn().mockRejectedValue(new Error('API unavailable')),
+      });
+      queue.addChapters([job]);
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(job.status).toBe('failed');
+      expect(job.error).toBe('API unavailable');
     });
 
     it('chapter with imageUrls goes through extracting→downloading→done', async () => {

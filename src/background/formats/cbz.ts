@@ -83,7 +83,7 @@ export function generateComicInfoXml(options: CbzOptions): string {
   // Page count
   lines.push(`  <PageCount>${options.images.length}</PageCount>`);
   // Web (reader URL)
-  lines.push(`  <Web>https://kagane.to/series/${escapeXml(options.seriesId)}/reader/${escapeXml(options.bookId)}</Web>`);
+  lines.push(`  <Web>https://kagane.moe/series/${escapeXml(options.seriesId)}/reader/${escapeXml(options.bookId)}</Web>`);
   // Manga reading direction (right-to-left for manga/manhwa)
   lines.push('  <Manga>Yes</Manga>');
   // Series status

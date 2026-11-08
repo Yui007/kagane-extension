@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   normalizeSeries,
+  parseBooks,
   getImageUrl,
   createSeries,
   IMAGE_BASE_URL,
@@ -242,9 +243,43 @@ describe('normalizeSeries()', () => {
   });
 });
 
+describe('parseBooks()', () => {
+  it('maps packed rows using the fields header', () => {
+    const books = parseBooks({
+      fields: ['book_id', 'chapter_no', 'title', 'sort_no', 'page_count', 'published_on', 'uploader'],
+      books: [
+        [
+          'b1',
+          '5',
+          'Chapter 5',
+          5.5,
+          12,
+          '2024-01-01T00:00:00Z',
+          { user_id: 'u1', username: 'uploader', avatar_image_id: '', class: 'User' },
+        ],
+      ],
+    });
+
+    expect(books).toHaveLength(1);
+    expect(books[0].bookId).toBe('b1');
+    expect(books[0].chapterNo).toBe('5');
+    expect(books[0].sortNo).toBe(5.5);
+    expect(books[0].pageCount).toBe(12);
+    expect(books[0].createdAt).toBe('2024-01-01T00:00:00Z');
+    expect(books[0].uploader?.userClass).toBe('User');
+  });
+});
+
 describe('getImageUrl()', () => {
   it('constructs correct image URL from image ID', () => {
     const url = getImageUrl('abc123');
-    expect(url).toBe('https://yuzuki.kagane.to/api/v2/image/abc123');
+    expect(url).toBe('https://kagane.moe/api/v2/image/abc123');
+  });
+});
+
+describe('content rating fallback', () => {
+  it('uses age_rating when content_rating is absent', () => {
+    const series = normalizeSeries({ age_rating: 'Mature' });
+    expect(series.contentRating).toBe('Mature');
   });
 });

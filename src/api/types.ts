@@ -9,7 +9,7 @@
 // Constants
 // ──────────────────────────────────────────
 
-export const IMAGE_BASE_URL = 'https://yuzuki.kagane.to/api/v2/image';
+export const IMAGE_BASE_URL = 'https://kagane.moe/api/v2/image';
 
 export function getImageUrl(imageId: string): string {
   return `${IMAGE_BASE_URL}/${imageId}`;
@@ -333,6 +333,25 @@ function parseSeriesStaff(data: Record<string, unknown>): SeriesStaff {
 }
 
 /**
+ * Parse the packed chapter list from /series/{id}/books/index.
+ * Response shape: { fields: string[], books: unknown[][] }
+ */
+export function parseBooks(data: Record<string, unknown>): Book[] {
+  const fields = Array.isArray(data.fields) ? data.fields.map(String) : [];
+  const rows = Array.isArray(data.books) ? data.books : [];
+
+  return rows.map((row) => {
+    const values = Array.isArray(row) ? row : [];
+    const record: Record<string, unknown> = {};
+    fields.forEach((field, index) => {
+      record[field] = values[index];
+    });
+    record.created_at = record.published_on ?? '';
+    return parseBook(record);
+  });
+}
+
+/**
  * Parse raw snake_case API JSON into a fully typed Series object.
  * Safe to call with partial/missing data — all fields default to empty values.
  */
@@ -370,7 +389,7 @@ export function normalizeSeries(data: Record<string, unknown>): Series {
     title: String(data.title ?? ''),
     description: String(data.description ?? ''),
     format: String(data.format ?? ''),
-    contentRating: String(data.content_rating ?? ''),
+    contentRating: String(data.content_rating || data.age_rating || ''),
     publicationStatus: String(data.publication_status ?? ''),
     uploadStatus: String(data.upload_status ?? ''),
     originalLanguage: String(data.original_language ?? ''),

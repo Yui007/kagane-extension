@@ -32,6 +32,8 @@ export interface ChapterJob {
   status: ChapterStatus;
   progress: number; // 0–100
   imageUrls: string[]; // filled after extraction
+  /** Optional API loader run under chapter concurrency. */
+  loadImageUrls?: () => Promise<string[]>;
   downloadedImages: FetchedImage[];
   error?: string;
   processedPages?: number;
@@ -107,6 +109,10 @@ export class DownloadQueue {
   private abortController = new AbortController();
   private aborted = false;
   private activePdfConversions = 0;
+  private completionNotified = false;
+
+  /** Called once when every chapter has finished (done or failed). */
+  onComplete?: () => void;
 
   constructor(
     maxConcurrentChapters: number = 3,
@@ -125,6 +131,7 @@ export class DownloadQueue {
    * Returns immediately (non-blocking).
    */
   addChapters(jobs: ChapterJob[]): void {
+    this.completionNotified = false;
     for (const job of jobs) {
       if (!job.bookId || !job.seriesId) {
         console.warn('[Kagane] Invalid job — missing bookId or seriesId', job);
@@ -213,8 +220,22 @@ export class DownloadQueue {
       job.status = 'extracting_urls';
       this.notifyProgress();
 
+      if ((!job.imageUrls || job.imageUrls.length === 0) && job.loadImageUrls) {
+        try {
+          job.imageUrls = await job.loadImageUrls();
+        } catch (err) {
+          this.failJob(job, err instanceof Error ? err.message : String(err));
+          return;
+        }
+      }
+
       if (!job.imageUrls || job.imageUrls.length === 0) {
         this.failJob(job, 'No image URLs provided');
+        return;
+      }
+
+      if (this.aborted) {
+        this.failJob(job, 'Download cancelled');
         return;
       }
 
@@ -272,7 +293,7 @@ export class DownloadQueue {
         await this.imageSemaphore.acquire();
         try {
           if (this.aborted) return;
-          await saveDirectImage(url, job.seriesTitle, job.chapterNo, index + 1);
+          await saveDirectImage(url, job.seriesTitle, job.chapterNo, index + 1, urlExtension(url));
           successCount++;
         } catch (err) {
           console.warn(`[Kagane] Failed to download image ${index + 1}/${total}:`, err);
@@ -294,10 +315,10 @@ export class DownloadQueue {
         try {
           if (this.aborted) return;
           const pageNum = String(index + 1).padStart(3, '0');
-          const filename = `${pageNum}.bin`;
-          const fetched = await fetchImage(url, filename, {
+          const ext = urlExtension(url);
+          const fetched = await fetchImage(url, `${pageNum}.${ext}`, {
             signal: this.getAbortSignal(),
-            ext: 'webp',
+            ext,
           });
           results[index] = { index, image: fetched };
           successCount++;
@@ -442,7 +463,9 @@ export class DownloadQueue {
     const doneCount = [...this.chapters.values()].filter(
       (c) => c.status === 'done' || c.status === 'failed',
     ).length;
-    if (total > 0 && doneCount === total) {
+    if (total > 0 && doneCount === total && !this.completionNotified) {
+      this.completionNotified = true;
+      this.onComplete?.();
       const succeeded = [...this.chapters.values()].filter((c) => c.status === 'done').length;
       chrome.runtime.sendMessage({
         type: 'download:complete',
@@ -464,4 +487,9 @@ export class DownloadQueue {
   private getAbortSignal(): AbortSignal {
     return this.abortController.signal;
   }
+}
+
+/** Page URLs carry the real format: .../page-id.webp?token=... */
+function urlExtension(url: string): string {
+  return url.match(/\.([a-z0-9]+)(?:\?|$)/i)?.[1]?.toLowerCase() || 'webp';
 }

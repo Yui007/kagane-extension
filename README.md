@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Chrome Extension](https://img.shields.io/badge/Chrome_Extension-MV3-blue.svg)](#)
 
-A powerful, developer-friendly Chrome extension designed to download manga chapters directly from `kagane.to` with support for multiple high-quality output formats including raw Images, CBZ (Comic Book ZIP), and PDF.
+A powerful, developer-friendly Chrome extension designed to download manga chapters directly from `kagane.moe` with support for multiple high-quality output formats including raw Images, CBZ (Comic Book ZIP), and PDF.
 
 > [!TIP]
 > **Looking for a CLI or GUI application?** Check out [Kagane Downloader](https://github.com/Yui007/kagane-downloader) – the Python-based alternative with both command-line and graphical interfaces for batch chapter downloads.
@@ -22,9 +22,9 @@ A powerful, developer-friendly Chrome extension designed to download manga chapt
   - **Images**: Raw images (`.jpg`/`.png`) in structured directories.
   - **CBZ**: Comic Book ZIP archives, ready for your favorite reader.
   - **PDF**: Single, high-quality document per chapter.
-- **Smart Metadata Loading**: Paste any `kagane.to` series URL, reader URL, or Series ID to load chapter lists instantly.
+- **Smart Metadata Loading**: Paste any `kagane.moe` series URL, reader URL, or Series ID to load chapter lists instantly.
 - **Background Downloader**: Built on Chrome Extension Manifest V3 (MV3). Downloads run asynchronously in a Service Worker, preventing loss of progress even when closing the popup.
-- **Secure Bypass & DNR Routing**: Utilizes `declarativeNetRequest` (DNR) rules to handle request headers (`Referer` and `Origin`), bypassing hotlinking protections on CDN hosts (e.g., `kstatic.to`, `yuzuki.kagane.to`, `akari.kagane.to`).
+- **Secure Bypass & DNR Routing**: Utilizes `declarativeNetRequest` (DNR) rules to handle request headers (`Referer` and `Origin`), bypassing hotlinking protections on CDN hosts (e.g., `kstatic.to`).
 - **Concurrent Processing & Queue**: Configure chapter and page concurrency to balance speed and rate-limiting safety.
 - **Dynamic Progress Tracking**: Live-updated progress bars, statuses, and history logs inside the extension popup.
 
@@ -78,11 +78,11 @@ A powerful, developer-friendly Chrome extension designed to download manga chapt
 kagane-extension/
 ├── public/
 │   ├── manifest.json      # Extension configuration and permission rules
-│   ├── icons/             # Custom extension icons (16x16, 48x48, 128x128)
-│   └── content-reader.js  # Script injected into reader tabs to query DRM assets
+│   ├── api-bridge.js      # Proxies API calls through a kagane.moe tab (Cloudflare cookies)
+│   └── icons/             # Custom extension icons (16x16, 48x48, 128x128)
 ├── src/
 │   ├── api/
-│   │   ├── client.ts      # Fetch-based API client with auto-retries and backoff
+│   │   ├── client.ts      # Fetch-based API client (integrity token + page manifests)
 │   │   └── types.ts       # Types and normalization logic for Kagane responses
 │   ├── background/
 │   │   ├── download-queue.ts  # Class managing parallel chapter job queues

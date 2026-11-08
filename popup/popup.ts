@@ -754,8 +754,8 @@ async function autoDetectSeries(): Promise<void> {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs[0];
     if (tab?.url) {
-      // Only auto-detect on kagane.to series pages
-      const seriesMatch = tab.url.match(/https:\/\/kagane\.to\/series\/([^/]+)/);
+      // Only auto-detect on Kagane series pages
+      const seriesMatch = tab.url.match(/https:\/\/kagane\.(?:moe|to|net|cx)\/series\/([^/]+)/);
       if (seriesMatch) {
         // Pre-fill the input and auto-load
         seriesUrlInput.value = tab.url;

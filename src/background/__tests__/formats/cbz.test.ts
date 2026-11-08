@@ -115,7 +115,7 @@ describe('generateComicInfoXml', () => {
 
   it('includes Web tag with reader URL', () => {
     const xml = generateComicInfoXml(makeOptions({ seriesId: '123', bookId: '456' }));
-    expect(xml).toContain('https://kagane.to/series/123/reader/456');
+    expect(xml).toContain('https://kagane.moe/series/123/reader/456');
   });
 
   it('escapes special XML characters in titles', () => {

@@ -150,6 +150,7 @@ async function fetchFromUrl(
     try {
       const response = await fetch(url, {
         signal,
+        credentials: 'include',
         headers: { Accept: 'image/webp,image/*,*/*' },
       });
 
